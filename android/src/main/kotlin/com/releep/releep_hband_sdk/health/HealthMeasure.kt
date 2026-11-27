@@ -77,6 +77,16 @@ class HealthMeasure(
     private var lastValue: Any? = null
     private var firstValueAt = 0L
 
+    // Temperature watches can briefly report "device busy" while an automatic
+    // health reading is finishing. They can also report the raw/skin value in
+    // an earlier callback and omit it from the final (100%) callback.
+    private var temperatureBusyRetries = 0
+    private var temperatureRetryScheduled = false
+    private var lastTemperatureBase: Double? = null
+    /** Callbacks of an attempt that was already retried are ignored. */
+    private var temperatureAttempt = 0
+    private val temperatureRetry = Runnable { startTemperatureMeasurement() }
+
     // ECG accumulation
     private val wave = ArrayList<Int>()
     private var ecgFrequency = 0
@@ -111,6 +121,9 @@ class HealthMeasure(
 
         /** PTT has no final result event — capture this long, then build the record. */
         private const val PTT_CAPTURE_MS = 30_000L
+
+        private const val TEMPERATURE_MAX_BUSY_RETRIES = 3
+        private const val TEMPERATURE_BUSY_RETRY_MS = 1_500L
     }
 
     private val timeout = Runnable { fail("Measurement timed out") }
@@ -169,24 +182,7 @@ class HealthMeasure(
                 }
             }
 
-            BODY_TEMP -> manager.startDetectTempture(write) { data ->
-                main.post {
-                    when {
-                        data.oprate == 0 -> fail("Temperature measurement not supported")
-                        data.deviceState in 1..7 -> fail("Watch is busy")
-                        data.deviceState == 8 -> fail("Watch battery is low")
-                        data.deviceState == 9 -> fail("Temperature sensor error")
-                        else -> {
-                            update(data.progress, if (data.tempture > 0) data.tempture else null)
-                            if (data.progress >= 100 && data.tempture > 0) {
-                                succeed(mutableMapOf<String, Any?>("value" to HealthSync.round2(data.tempture.toDouble())).apply {
-                                    if (data.temptureBase > 0) this["base_temp"] = HealthSync.round2(data.temptureBase.toDouble())
-                                })
-                            }
-                        }
-                    }
-                }
-            }
+            BODY_TEMP -> startTemperatureMeasurement()
 
             FATIGUE -> manager.startDetectFatigue(write) { data ->
                 main.post {
@@ -245,6 +241,54 @@ class HealthMeasure(
 
     // ------------------------------------------------------------------
 
+    private fun startTemperatureMeasurement() {
+        if (finished) return
+        temperatureRetryScheduled = false
+        val attempt = ++temperatureAttempt
+        manager.startDetectTempture(write) { data ->
+            main.post {
+                if (finished || attempt != temperatureAttempt) return@post
+                if (data.temptureBase > 0) {
+                    lastTemperatureBase = HealthSync.round2(data.temptureBase.toDouble())
+                }
+                when {
+                    data.oprate == 0 -> fail("Temperature measurement not supported")
+                    data.deviceState in 1..7 -> retryTemperatureAfterBusy()
+                    data.deviceState == 8 -> fail("Watch battery is low")
+                    data.deviceState == 9 -> fail("Temperature sensor error")
+                    else -> {
+                        update(
+                            data.progress,
+                            data.tempture.takeIf { it > 0 },
+                            lastTemperatureBase?.let { mapOf("base_temp" to it) } ?: emptyMap(),
+                        )
+                        if (data.progress >= 100 && data.tempture > 0) {
+                            succeed(
+                                mutableMapOf<String, Any?>(
+                                    "value" to HealthSync.round2(data.tempture.toDouble()),
+                                ).apply {
+                                    lastTemperatureBase?.let { this["base_temp"] = it }
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun retryTemperatureAfterBusy() {
+        if (temperatureRetryScheduled || finished) return
+        if (temperatureBusyRetries >= TEMPERATURE_MAX_BUSY_RETRIES) {
+            fail("Watch is busy")
+            return
+        }
+        temperatureBusyRetries++
+        temperatureRetryScheduled = true
+        update(null, null)
+        main.postDelayed(temperatureRetry, TEMPERATURE_BUSY_RETRY_MS)
+    }
+
     /** For values that keep streaming: finish [SETTLE_MS] after the first valid one. */
     private fun continuous(value: Int, progress: Int? = null, build: (Int) -> Map<String, Any?>) {
         lastValue = value
@@ -296,6 +340,7 @@ class HealthMeasure(
     private fun finish(result: Map<String, Any?>) {
         finished = true
         main.removeCallbacks(timeout)
+        main.removeCallbacks(temperatureRetry)
         stopDevice()
         onDone(result)
     }

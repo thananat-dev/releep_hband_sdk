@@ -199,6 +199,10 @@ public class ReleepHbandSdkPlugin: NSObject, FlutterPlugin, HBandManagerListener
             manager.cancelSync()
             result(nil)
 
+        case "confirmHealthUpload":
+            HealthSync.confirmUpload()
+            result(nil)
+
         case "startMeasurement":
             manager.startMeasure(type: args["type"] as? String ?? "",
                                  onUpdate: { [weak self] u in self?.progressSink?(u) }) { [weak self] outcome, error in

@@ -1,3 +1,17 @@
+## 0.0.2
+
+* Sleep: precise sleep segments linked by `lastType` / `nextType` (iOS) or `laster` / `next`
+  (Android) are joined into one record per night (start of the first segment, end of the last,
+  durations for the whole night, scores of the last segment, new `segments` field).
+  `awakeShort` = `getUpDuration`, `rem` = REM minutes of the curve.
+* Sleep: `sleep_line` is one digit per minute on both platforms; corrupt segments (longer than
+  24 h or in the future) are skipped.
+* Body temperature measurement (Android + iOS): retries up to 3 times when the watch is busy and
+  keeps `base_temp` from earlier callbacks.
+* History sync: a step is given up after 30 s without progress instead of its full timeout.
+* RR interval only reads blocks not read before. New `HBandSdk.confirmHealthUpload()`: call it
+  after the sync's records reached the backend; until then the same blocks are read again.
+
 ## 0.0.1
 
 * On-demand measurement: added `hrv`, `respiratory`, `bloodcomponent`, `bodycomposition`, `gsr`,

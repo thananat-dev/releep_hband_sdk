@@ -260,6 +260,11 @@ abstract final class HBandSdk {
   /// Stops a running sync after the current step; the result has `cancelled: true`.
   static Future<void> cancelHealthSync() => _method.invokeMethod('cancelHealthSync');
 
+  /// Call after the records of the last [syncHealthData] reached the backend.
+  /// RR interval is read incrementally: without this confirmation the next
+  /// sync reads the same blocks again, so nothing is lost when an upload fails.
+  static Future<void> confirmHealthUpload() => _method.invokeMethod('confirmHealthUpload');
+
   /// Progress of [syncHealthData].
   static Stream<HBandSyncProgress> get syncProgress =>
       _progressStream.where((m) => m['kind'] == 'sync').map(HBandSyncProgress.fromMap);

@@ -90,7 +90,18 @@ class HealthSync(
         val wanted: Set<String>,
         val supported: () -> Boolean,
         val run: (done: (String?) -> Unit) -> Unit,
+        /** False when the SDK gives no progress while the step runs: only the full timeout applies. */
+        val reportsProgress: Boolean = true,
     )
+
+    /**
+     * A step whose watch stops answering is given up after this long without
+     * any progress, instead of waiting for its full timeout (up to minutes).
+     */
+    private val idleLimitMs = 30_000L
+    private var idleTimeout: Runnable? = null
+    private var idleLimitForStep = 0L
+    private var currentStage: String? = null
 
     private val watchDays: Int
         get() = WatchSession.watchDays(context).coerceAtLeast(1)
@@ -113,7 +124,7 @@ class HealthSync(
         ),
         Step("rrinterval", 120_000, setOf(RR_INTERVAL), { true }, ::readRrInterval),
         Step("sport", 90_000, setOf(SPORT), { sp.isSupportSportModel }, ::readSport),
-        Step("ecg", 90_000, setOf(ECG), { sp.isSupportECG }, ::readEcg),
+        Step("ecg", 90_000, setOf(ECG), { sp.isSupportECG }, ::readEcg, reportsProgress = false),
         Step("heartwarning", 10_000, setOf(HEART_WARNING), { true }, ::readHeartWarning),
     )
 
@@ -130,6 +141,7 @@ class HealthSync(
     fun abort(reason: String) = main.post {
         if (ended) return@post
         stepTimeout?.let { main.removeCallbacks(it) }
+        clearIdle()
         errors["link"] = reason
         finish(cancelledByUser = false)
     }
@@ -146,23 +158,37 @@ class HealthSync(
             skipped += step.name
             return next()
         }
-        progress(step.name, null)
         var answered = false
         val timeout = Runnable {
             if (!answered) {
                 answered = true
+                clearIdle()
                 errors[step.name] = "timeout"
                 next()
             }
         }
         stepTimeout = timeout
         main.postDelayed(timeout, step.timeoutMs)
+        currentStage = step.name
+        idleLimitForStep = if (step.reportsProgress) minOf(idleLimitMs, step.timeoutMs) else step.timeoutMs
+        idleTimeout = Runnable {
+            if (!answered) {
+                answered = true
+                main.removeCallbacks(timeout)
+                clearIdle()
+                errors[step.name] = "timeout (no response for ${idleLimitForStep / 1000} s)"
+                next()
+            }
+        }
+        progress(step.name, null)
+        armIdle()
         try {
             step.run { error ->
                 main.post {
                     if (answered) return@post
                     answered = true
                     main.removeCallbacks(timeout)
+                    clearIdle()
                     if (error != null) errors[step.name] = error
                     // Short gap: the SDK needs a moment between commands.
                     main.postDelayed({ next() }, 150)
@@ -173,13 +199,29 @@ class HealthSync(
             if (!answered) {
                 answered = true
                 main.removeCallbacks(timeout)
+                clearIdle()
                 errors[step.name] = e.message ?: e.javaClass.simpleName
                 next()
             }
         }
     }
 
+    /** (Re)starts the no-progress timer of the running step. Main thread only. */
+    private fun armIdle() {
+        val idle = idleTimeout ?: return
+        main.removeCallbacks(idle)
+        main.postDelayed(idle, idleLimitForStep)
+    }
+
+    private fun clearIdle() {
+        idleTimeout?.let { main.removeCallbacks(it) }
+        idleTimeout = null
+        currentStage = null
+    }
+
     private fun progress(stage: String, fraction: Float?) {
+        // Any sign of life from the running step restarts its idle timer.
+        main.post { if (!ended && stage == currentStage) armIdle() }
         val stageIndex = steps.indexOfFirst { it.name == stage }.coerceAtLeast(0)
         val overall = (stageIndex + (fraction ?: 0f).coerceIn(0f, 1f)) / steps.size
         main.post {
@@ -197,6 +239,11 @@ class HealthSync(
     private fun finish(cancelledByUser: Boolean) {
         if (ended) return
         ended = true
+        clearIdle()
+        // A sleep step that timed out still returns the segments read so far.
+        flushSleepNights()
+        // RR bookmarks wait for the app to confirm the upload (confirmUpload).
+        stashRrBookmarks()
         val records = bag.toMap().filterKeys { it in types }
         onDone(
             mapOf(
@@ -402,33 +449,57 @@ class HealthSync(
 
             override fun onSleepProgress(p: Float) = progress("sleep", p)
             override fun onSleepProgressDetail(day: String?, packageNumber: Int) {}
-            override fun onReadSleepComplete() = done(null)
+            override fun onReadSleepComplete() {
+                // A night's segments can arrive under different days.
+                flushSleepNights()
+                done(null)
+            }
         }, readDays)
     }
 
     /**
-     * REM / awake minutes of a precise sleep curve. Newer firmware writes a hex
-     * string, 4 chars (16 bits) per minute, state = value >> 13: 0 deep, 1 light,
-     * 2 REM, 3 insomnia, 4 awake. Older ones write 1 char per minute (2 = REM, 4 = awake).
+     * Precise sleep curve → one digit per minute (0 deep, 1 light, 2 REM,
+     * 3 insomnia, 4 awake). Newer firmware writes a hex string, 4 chars
+     * (16 bits) per minute with state = value >> 13; older ones already write
+     * 1 char per minute. Both platforms send this same format.
      */
-    private fun preciseRemAwake(line: String, minutes: Int): Pair<Int, Int> {
-        if (minutes > 0 && line.length >= minutes * 2) {
-            val step = line.length / minutes
-            val states = (0..line.length - step step step).map { (line[it].digitToIntOrNull(16) ?: 0) shr 1 }
-            return states.count { it == 2 } to states.count { it == 4 }
+    private fun preciseLine(line: String, minutes: Int): String {
+        if (minutes <= 0 || line.length < minutes * 2) return line
+        val step = line.length / minutes
+        return (0..line.length - step step step).joinToString("") { i ->
+            minOf((line[i].digitToIntOrNull(16) ?: 0) shr 1, 4).toString()
         }
-        return line.count { it == '2' } to line.count { it == '4' }
     }
+
+    /** Drops corrupt segments (e.g. year 2039, months long): at most 24 h, not in the future. */
+    private fun saneSleep(start: Long, end: Long): Boolean =
+        end > start && end - start <= 24 * 3_600_000L && start <= System.currentTimeMillis() + 3_600_000L
+
+    private class SleepSegment(val start: Long, val end: Long, val data: SleepPrecisionData, val line: String) {
+        val linksPrevious get() = data.laster == 1
+        /** 255 = the watch does not know yet (night still going on). */
+        val linksNext get() = data.next == 1
+    }
+
+    /** Precise segments of every day read, joined into nights by [flushSleepNights]. */
+    private val sleepSegments = ArrayList<SleepSegment>()
 
     private fun onSleep(data: SleepData) {
         val start = HealthRecords.millis(data.sleepDown) ?: return
         val end = HealthRecords.millis(data.sleepUp) ?: return
-        if (end <= start || data.allSleepTime <= 0) return
+        if (!saneSleep(start, end) || data.allSleepTime <= 0) return
         val line = data.sleepLine ?: ""
+        if (data is SleepPrecisionData) {
+            sleepSegments += SleepSegment(start, end, data, preciseLine(line, ((end - start) / 60_000).toInt()))
+            return
+        }
+        // Normal curve: 1 char = 5 minutes; 2 = awake.
         val record = mutableMapOf<String, Any?>(
             "allSleep" to data.allSleepTime,
             "deepSleep" to data.deepSleepTime,
             "lightSleep" to data.lowSleepTime,
+            "rem" to 0,
+            "awakeShort" to line.count { it == '2' } * 5,
             "startTime" to start,
             "endTime" to end,
             "sleep_date" to data.date,
@@ -436,24 +507,74 @@ class HealthSync(
             "wake_count" to data.wakeCount,
             "sleep_line" to line,
         )
-        if (data is SleepPrecisionData) {
-            val (rem, awake) = preciseRemAwake(line, ((end - start) / 60_000).toInt())
-            record["rem"] = rem
-            record["awakeShort"] = awake
-            record["fall_asleep_score"] = data.fallAsleepScore
-            record["deep_score"] = data.deepScore
-            record["sleep_efficiency_score"] = data.sleepEfficiencyScore
-            record["sleep_time_score"] = data.sleepTimeScore
-            record["getup_score"] = data.getUpScore
-            record["insomnia_score"] = data.insomniaScore
-            record["insomnia_times"] = data.insomniaTimes
-            record["insomnia_length"] = data.insomniaLength
-        } else {
-            // Normal curve: 1 char = 5 minutes; 2 = awake.
-            record["rem"] = 0
-            record["awakeShort"] = line.count { it == '2' } * 5
-        }
         bag.put(SLEEP, record, key = start.toString())
+    }
+
+    /**
+     * Joins linked segments (laster / next) into one record per night: start
+     * of the first, end of the last, curve joined (gaps = awake), durations
+     * for the whole night, scores and other values of the last.
+     */
+    private fun flushSleepNights() {
+        val segments = sleepSegments.sortedBy { it.start }.distinctBy { it.start }
+        sleepSegments.clear()
+        var night = ArrayList<SleepSegment>()
+        for (segment in segments) {
+            val previous = night.lastOrNull()
+            if (previous != null && (previous.linksNext || segment.linksPrevious) && segment.start >= previous.end) {
+                night += segment
+            } else {
+                if (night.isNotEmpty()) addSleepNight(night)
+                night = arrayListOf(segment)
+            }
+        }
+        if (night.isNotEmpty()) addSleepNight(night)
+    }
+
+    private fun addSleepNight(night: List<SleepSegment>) {
+        val first = night.first()
+        val last = night.last()
+        val line = StringBuilder(first.line)
+        night.zipWithNext { previous, segment ->
+            val gap = ((segment.start - previous.end) / 60_000).toInt()
+            if (gap > 0) line.append("4".repeat(gap))
+            line.append(segment.line)
+        }
+        val d = last.data
+        // Some firmwares put the whole night's totals in the last segment
+        // (longer than that segment itself); otherwise add the segments up.
+        val lastSpan = ((last.end - last.start) / 60_000).toInt()
+        val cumulative = night.size > 1 && d.allSleepTime > lastSpan + 1
+        fun total(value: (SleepPrecisionData) -> Int) = if (cumulative) value(d) else night.sumOf { value(it.data) }
+        val rem = line.count { it == '2' }
+        val record = mutableMapOf<String, Any?>(
+            "allSleep" to total { it.allSleepTime },
+            "deepSleep" to total { it.deepSleepTime },
+            "lightSleep" to total { it.lowSleepTime },
+            "rem" to rem,
+            "awakeShort" to total { it.getUpDuration },
+            "startTime" to first.start,
+            "endTime" to last.end,
+            "sleep_date" to d.date,
+            "sleep_line" to line.toString(),
+            "segments" to night.size,
+            "sleep_quality" to d.sleepQulity,
+            "wake_count" to d.wakeCount,
+            "fall_asleep_score" to d.fallAsleepScore,
+            "deep_score" to d.deepScore,
+            "sleep_efficiency_score" to d.sleepEfficiencyScore,
+            "sleep_time_score" to d.sleepTimeScore,
+            "getup_score" to d.getUpScore,
+            "insomnia_score" to d.insomniaScore,
+            "insomnia_times" to d.insomniaTimes,
+            "insomnia_length" to d.insomniaLength,
+        )
+        // TODO(after a real multi-segment night): confirm which of sum / last
+        // matches the watch, then drop the `cumulative` guess.
+        Log.d(TAG, "sleep night ${d.date} segments=${night.size} cumulative=$cumulative " +
+            "allSleep sum=${night.sumOf { it.data.allSleepTime }} last=${d.allSleepTime} " +
+            "rem(line)=$rem otherDuration=${total { it.otherDuration }}")
+        if (record["allSleep"] as Int > 0) bag.put(SLEEP, record, key = first.start.toString())
     }
 
     // ---- temperature (devices whose temperatureType != 5) ----
@@ -482,26 +603,54 @@ class HealthSync(
 
     // ---- RR interval, one day after another ----
 
+    // RR interval: the watch makes one block per minute (1440 a day) and the
+    // read can start at any block. Remember the last block read per watch and
+    // day so each sync only transfers the new blocks.
+    private val rrPrefs by lazy { rrPrefs(context) }
+    /** Bookmarks reached in this run, saved when the sync ends. */
+    private val rrPending = HashMap<String, Int>()
+
+    private fun rrDate(daysAgo: Int) = rrDateKey(daysAgo)
+
+    private fun rrKey(date: String) = "rr|${WatchSession.mac(context)}|$date"
+
     private fun readRrInterval(done: (String?) -> Unit) {
         val dayStates = listOf(DayState.TODAY, DayState.YESTERDAY, DayState.BEFORE_YESTERDAY).take(readDays)
         fun read(index: Int) {
             if (index >= dayStates.size) return done(null)
+            val key = rrKey(rrDate(index))
+            val last = rrPrefs.getInt(key, 0)
+            // A past day that was read to its end cannot get new blocks.
+            if (last >= RR_BLOCKS_PER_DAY) return read(index + 1)
             manager.readRRIntervalByDay(write, object : IRRIntervalProgressListener {
                 override fun onReadRRIntervalProgressChanged(p: Float, data: RRIntervalData?) {
                     progress("rrinterval", (index + p) / dayStates.size)
                 }
 
                 override fun onReadRRIntervalComplete(state: DayState?, list: MutableList<RRIntervalData>?) {
+                    var maxBlock = last
                     list?.forEach { rr ->
+                        maxBlock = maxOf(maxBlock, rr.blockNumber)
                         val time = HealthRecords.time(null, rr.date) ?: return@forEach
                         val values = HealthRecords.clip(rr.data?.filter { it > 0 }?.toIntArray()) ?: return@forEach
                         bag.put(RR_INTERVAL, mutableMapOf("rr_arry" to values, "time" to time))
                     }
+                    rrPending[key] = if (index > 0) RR_BLOCKS_PER_DAY else maxBlock
                     main.postDelayed({ read(index + 1) }, 100)
                 }
-            }, dayStates[index], 0)
+            }, dayStates[index], if (last > 0) last + 1 else 0)
         }
         read(0)
+    }
+
+    /**
+     * Keeps this run's RR bookmarks until the app confirms that the records
+     * reached the backend ([confirmUpload]); an unconfirmed run is read again.
+     */
+    private fun stashRrBookmarks() {
+        if (RR_INTERVAL !in types) return
+        pendingRr = HashMap(rrPending)
+        rrPending.clear()
     }
 
     // ---- sport sessions ----
@@ -603,6 +752,34 @@ class HealthSync(
 
     companion object {
         private const val TAG = "HBandSync"
+        private const val RR_BLOCKS_PER_DAY = 1440
+
+        /** RR bookmarks of the last sync, saved by [confirmUpload]. */
+        private var pendingRr: Map<String, Int> = emptyMap()
+
+        private fun rrPrefs(context: Context) =
+            context.getSharedPreferences("releep_hband_sync", Context.MODE_PRIVATE)
+
+        private fun rrDateKey(daysAgo: Int): String {
+            val cal = java.util.Calendar.getInstance().apply { add(java.util.Calendar.DAY_OF_YEAR, -daysAgo) }
+            return java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(cal.time)
+        }
+
+        /**
+         * The app uploaded the last sync's records: remember how far RR interval
+         * was read so the next sync only reads new blocks. Main thread.
+         */
+        fun confirmUpload(context: Context) {
+            val confirmed = pendingRr
+            pendingRr = emptyMap()
+            if (confirmed.isEmpty()) return
+            val prefs = rrPrefs(context)
+            val keep = (0..3).map { rrDateKey(it) }.toSet()
+            val editor = prefs.edit()
+            prefs.all.keys.filter { it.startsWith("rr|") && it.substringAfterLast('|') !in keep }.forEach { editor.remove(it) }
+            confirmed.forEach { (k, v) -> editor.putInt(k, maxOf(v, prefs.getInt(k, 0))) }
+            editor.apply()
+        }
 
         fun round2(v: Double): Double = Math.round(v * 100.0) / 100.0
 

@@ -148,6 +148,14 @@ final class HealthSync {
     private var ended = false
     private var stepTimeout: DispatchWorkItem?
     private var stepIndex = 0
+
+    /// A step whose watch stops answering is given up after this long without
+    /// any progress, instead of waiting for its full timeout (up to minutes).
+    private static let idleLimit: TimeInterval = 30
+    private var idleTimeout: DispatchWorkItem?
+    private var idleLimitForStep: TimeInterval = 0
+    private var onIdle: (() -> Void)?
+    private var currentStage: String?
     private let started = Date()
 
     private struct Step {
@@ -156,6 +164,9 @@ final class HealthSync {
         let wanted: Set<String>
         let supported: () -> Bool
         let run: (@escaping (String?) -> Void) -> Void
+        /// False when the SDK gives no progress while the step runs: then only
+        /// the full timeout applies, not [idleLimit].
+        var reportsProgress: Bool = true
     }
 
     private var steps: [Step] = []
@@ -180,7 +191,7 @@ final class HealthSync {
                  run: readTemperature),
             Step(name: "database", timeout: 30, wanted: Set(H.allTypes), supported: { true }, run: queryDatabase),
             Step(name: "rrinterval", timeout: 180, wanted: [H.rrInterval], supported: { true }, run: readRrInterval),
-            Step(name: "sport", timeout: 120, wanted: [H.sport], supported: { true }, run: readSport),
+            Step(name: "sport", timeout: 120, wanted: [H.sport], supported: { true }, run: readSport, reportsProgress: false),
             Step(name: "heartwarning", timeout: 10, wanted: [H.heartWarning], supported: { true }, run: readHeartWarning),
         ]
     }
@@ -211,6 +222,7 @@ final class HealthSync {
         DispatchQueue.main.async {
             guard !self.ended else { return }
             self.stepTimeout?.cancel()
+            self.clearIdle()
             self.errors["link"] = reason
             self.finish(cancelledByUser: false)
         }
@@ -229,21 +241,34 @@ final class HealthSync {
             skipped.append(step.name)
             return next()
         }
-        progress(step.name, nil)
         var answered = false
         let timeout = DispatchWorkItem { [weak self] in
             guard let self = self, !answered else { return }
             answered = true
+            self.clearIdle()
             self.errors[step.name] = "timeout"
             self.next()
         }
         stepTimeout = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + step.timeout, execute: timeout)
+        currentStage = step.name
+        idleLimitForStep = step.reportsProgress ? min(HealthSync.idleLimit, step.timeout) : step.timeout
+        onIdle = { [weak self] in
+            guard let self = self, !answered else { return }
+            answered = true
+            timeout.cancel()
+            self.clearIdle()
+            self.errors[step.name] = "timeout (no response for \(Int(self.idleLimitForStep)) s)"
+            self.next()
+        }
+        progress(step.name, nil)
+        armIdle()
         step.run { [weak self] error in
             DispatchQueue.main.async {
                 guard let self = self, !answered else { return }
                 answered = true
                 timeout.cancel()
+                self.clearIdle()
                 if let error = error { self.errors[step.name] = error }
                 // Short gap: the SDK needs a moment between commands.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.next() }
@@ -251,7 +276,28 @@ final class HealthSync {
         }
     }
 
+    /// (Re)starts the no-progress timer of the running step. Main thread only.
+    private func armIdle() {
+        idleTimeout?.cancel()
+        guard let fire = onIdle else { return }
+        let item = DispatchWorkItem { fire() }
+        idleTimeout = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + idleLimitForStep, execute: item)
+    }
+
+    private func clearIdle() {
+        idleTimeout?.cancel()
+        idleTimeout = nil
+        onIdle = nil
+        currentStage = nil
+    }
+
     private func progress(_ stage: String, _ fraction: Double?) {
+        // Any sign of life from the running step restarts its idle timer.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, !self.ended, stage == self.currentStage else { return }
+            self.armIdle()
+        }
         let index = Double(steps.firstIndex { $0.name == stage } ?? 0)
         let overall = (index + min(max(fraction ?? 0, 0), 1)) / Double(steps.count)
         var event: [String: Any] = ["kind": "sync", "stage": stage, "progress": overall]
@@ -262,6 +308,12 @@ final class HealthSync {
     private func finish(cancelledByUser: Bool) {
         guard !ended else { return }
         ended = true
+        clearIdle()
+        // RR bookmarks wait for the app to confirm the upload (confirmUpload).
+        if types.contains(HealthRecords.rrInterval) {
+            HealthSync.pendingRr = rrPending
+            rrPending.removeAll()
+        }
         let records = bag.toMap().filter { types.contains($0.key) }
         onDone([
             "success": errors.isEmpty && !cancelledByUser,
@@ -350,6 +402,8 @@ final class HealthSync {
             }
             progress("database", Double(index + 1) / Double(queryDates.count))
         }
+        // A night's segments can be stored under different dates.
+        flushSleepNights()
         group.notify(queue: .main) { done(nil) }
     }
 
@@ -496,56 +550,51 @@ final class HealthSync {
         }
     }
 
-    /// REM / awake minutes of a precise sleep curve. Newer firmware writes a hex
-    /// string, 4 chars (16 bits) per minute, state = value >> 13: 0 deep, 1 light,
-    /// 2 REM, 3 insomnia, 4 awake. Older ones write 1 char per minute (2 = REM, 4 = awake).
-    static func preciseRemAwake(_ line: String, minutes: Int) -> (Int, Int) {
+    /// Precise sleep curve → one digit per minute (0 deep, 1 light, 2 REM,
+    /// 3 insomnia, 4 awake). Newer firmware writes a hex string, 4 chars
+    /// (16 bits) per minute with state = value >> 13; older ones already write
+    /// 1 char per minute. Both platforms send this same format.
+    static func preciseLine(_ line: String, minutes: Int) -> String {
         let chars = Array(line)
-        if minutes > 0 && chars.count >= minutes * 2 {
-            let step = chars.count / minutes
-            let states = stride(from: 0, through: chars.count - step, by: step).map { (chars[$0].hexDigitValue ?? 0) >> 1 }
-            return (states.filter { $0 == 2 }.count, states.filter { $0 == 4 }.count)
-        }
-        return (chars.filter { $0 == "2" }.count, chars.filter { $0 == "4" }.count)
+        guard minutes > 0, chars.count >= minutes * 2 else { return line }
+        let step = chars.count / minutes
+        return String(stride(from: 0, through: chars.count - step, by: step).map { i -> Character in
+            let state = (chars[i].hexDigitValue ?? 0) >> 1
+            return Character(String(min(state, 4)))
+        })
     }
+
+    /// One precise sleep segment as stored by the watch.
+    private struct SleepSegment {
+        let start: Date
+        let end: Date
+        let date: String
+        let model: VPAccurateSleepModel
+        let line: String // 1 digit per minute
+        var linksPrevious: Bool { HealthRecords.int(model.lastType) == 1 }
+        /// 255 = the watch does not know yet (night still going on).
+        var linksNext: Bool { HealthRecords.int(model.nextType) == 1 }
+    }
+
+    /// Precise segments of every queried date, joined into nights by [flushSleepNights].
+    private var sleepSegments: [SleepSegment] = []
 
     private func querySleep(_ date: String) {
         if (model?.sleepType ?? 0) == 1 {
             for s in VPDataBaseOperation.veepooSDKGetAccurateSleepData(withDate: date, andTableID: tableId) ?? [] {
-                guard let start = HealthRecords.parse(s.sleepTime), let end = HealthRecords.parse(s.wakeTime), end > start else { continue }
-                let line = s.sleepLine
-                let (rem, awake) = HealthSync.preciseRemAwake(line, minutes: Int(end.timeIntervalSince(start) / 60))
-                var record: [String: Any] = [
-                    "allSleep": HealthRecords.int(s.sleepDuration) ?? 0,
-                    "deepSleep": HealthRecords.int(s.deepDuration) ?? 0,
-                    "lightSleep": HealthRecords.int(s.lightDuration) ?? 0,
-                    "rem": rem,
-                    "awakeShort": awake,
-                    "startTime": Int64(start.timeIntervalSince1970 * 1000),
-                    "endTime": Int64(end.timeIntervalSince1970 * 1000),
-                    "sleep_date": date,
-                    "sleep_line": line,
-                ]
-                let ints: [(String, String?)] = [
-                    ("sleep_quality", s.sleepQuality), ("wake_count", s.getUpTimes),
-                    ("fall_asleep_score", s.fallAsleepScore), ("deep_score", s.deepScore),
-                    ("sleep_efficiency_score", s.sleepEfficiencyScore), ("sleep_time_score", s.sleepTimeScore),
-                    ("getup_score", s.getUpScore), ("insomnia_score", s.insomniaScore),
-                    ("insomnia_times", s.insomniaTimes), ("insomnia_length", s.insomniaDuration),
-                ]
-                for (field, value) in ints {
-                    if let v = HealthRecords.int(value) { record[field] = v }
-                }
-                if (record["allSleep"] as? Int ?? 0) > 0 {
-                    bag.put(HealthRecords.sleep, record, key: String(describing: record["startTime"]!))
-                }
+                guard let start = HealthRecords.parse(s.sleepTime), let end = HealthRecords.parse(s.wakeTime),
+                      HealthSync.saneSleep(start, end) else { continue }
+                let minutes = Int(end.timeIntervalSince(start) / 60)
+                sleepSegments.append(SleepSegment(start: start, end: end, date: date, model: s,
+                                                  line: HealthSync.preciseLine(s.sleepLine ?? "", minutes: minutes)))
             }
             return
         }
         let list = VPDataBaseOperation.veepooSDKGetSleepData(withDate: date, andTableID: tableId) as? [[String: Any]] ?? []
         for item in list {
             guard let start = HealthRecords.parse(item["SLEEP_TIME"] as? String),
-                  let end = HealthRecords.parse(item["WAKE_TIME"] as? String), end > start else { continue }
+                  let end = HealthRecords.parse(item["WAKE_TIME"] as? String),
+                  HealthSync.saneSleep(start, end) else { continue }
             let deep = Int(((HealthRecords.double(item["DEEP_HOUR"]) ?? 0) * 60).rounded())
             let light = Int(((HealthRecords.double(item["LIGHT_HOUR"]) ?? 0) * 60).rounded())
             let total = (HealthRecords.int(item["SLE_HOUR"]) ?? 0) * 60 + (HealthRecords.int(item["SLE_MINUTE"]) ?? 0)
@@ -567,6 +616,83 @@ final class HealthSync {
             if (record["allSleep"] as? Int ?? 0) > 0 {
                 bag.put(HealthRecords.sleep, record, key: String(describing: record["startTime"]!))
             }
+        }
+    }
+
+    /// Drops corrupt segments (e.g. year 2039, months long): end after start,
+    /// at most 24 h, not in the future.
+    static func saneSleep(_ start: Date, _ end: Date) -> Bool {
+        end > start && end.timeIntervalSince(start) <= 24 * 3600 && start <= Date().addingTimeInterval(3600)
+    }
+
+    /// Joins linked segments (lastType / nextType) into one record per night:
+    /// start of the first, end of the last, curve joined (gaps = awake),
+    /// durations for the whole night, scores and other values of the last.
+    private func flushSleepNights() {
+        var seen = Set<Date>()
+        let segments = sleepSegments.sorted { $0.start < $1.start }.filter { seen.insert($0.start).inserted }
+        sleepSegments.removeAll()
+        var night: [SleepSegment] = []
+        for segment in segments {
+            if let previous = night.last, previous.linksNext || segment.linksPrevious, segment.start >= previous.end {
+                night.append(segment)
+            } else {
+                if !night.isEmpty { addSleepNight(night) }
+                night = [segment]
+            }
+        }
+        if !night.isEmpty { addSleepNight(night) }
+    }
+
+    private func addSleepNight(_ night: [SleepSegment]) {
+        guard let first = night.first, let last = night.last else { return }
+        var line = first.line
+        for (previous, segment) in zip(night, night.dropFirst()) {
+            let gap = Int(segment.start.timeIntervalSince(previous.end) / 60)
+            if gap > 0 { line += String(repeating: "4", count: gap) }
+            line += segment.line
+        }
+        let m = last.model
+        func sum(_ value: (VPAccurateSleepModel) -> String?) -> Int {
+            night.reduce(0) { $0 + (HealthRecords.int(value($1.model)) ?? 0) }
+        }
+        // Some firmwares put the whole night's totals in the last segment
+        // (longer than that segment itself); otherwise add the segments up.
+        let lastSpan = Int(last.end.timeIntervalSince(last.start) / 60)
+        let cumulative = night.count > 1 && (HealthRecords.int(m.sleepDuration) ?? 0) > lastSpan + 1
+        func total(_ value: @escaping (VPAccurateSleepModel) -> String?) -> Int {
+            cumulative ? (HealthRecords.int(value(m)) ?? 0) : sum(value)
+        }
+        let rem = line.filter { $0 == "2" }.count
+        var record: [String: Any] = [
+            "allSleep": total { $0.sleepDuration },
+            "deepSleep": total { $0.deepDuration },
+            "lightSleep": total { $0.lightDuration },
+            "rem": rem,
+            "awakeShort": total { $0.getUpDuration },
+            "startTime": Int64(first.start.timeIntervalSince1970 * 1000),
+            "endTime": Int64(last.end.timeIntervalSince1970 * 1000),
+            "sleep_date": last.date,
+            "sleep_line": line,
+            "segments": night.count,
+        ]
+        let ints: [(String, String?)] = [
+            ("sleep_quality", m.sleepQuality), ("wake_count", m.getUpTimes),
+            ("fall_asleep_score", m.fallAsleepScore), ("deep_score", m.deepScore),
+            ("sleep_efficiency_score", m.sleepEfficiencyScore), ("sleep_time_score", m.sleepTimeScore),
+            ("getup_score", m.getUpScore), ("insomnia_score", m.insomniaScore),
+            ("insomnia_times", m.insomniaTimes), ("insomnia_length", m.insomniaDuration),
+        ]
+        for (field, value) in ints {
+            if let v = HealthRecords.int(value) { record[field] = v }
+        }
+        // TODO(after a real multi-segment night): confirm which of sum / last
+        // matches the watch, then drop the `cumulative` guess.
+        NSLog("HBand sleep night %@ segments=%d cumulative=%d allSleep sum=%d last=%d rem(line)=%d otherDuration=%d",
+              last.date, night.count, cumulative ? 1 : 0, sum { $0.sleepDuration },
+              HealthRecords.int(m.sleepDuration) ?? 0, rem, total { $0.otherDuration })
+        if (record["allSleep"] as? Int ?? 0) > 0 {
+            bag.put(HealthRecords.sleep, record, key: String(describing: record["startTime"]!))
         }
     }
 
@@ -599,31 +725,72 @@ final class HealthSync {
 
     // MARK: RR interval (two bytes per value, little endian, ms)
 
+    // RR interval: the watch makes one block per minute (1440 a day) and the
+    // read can start at any block. Remember the last block read per watch and
+    // day so each sync only transfers the new blocks.
+    private static let rrBookmarkKey = "releep_hband_sync.rrBookmarks"
+    private static let rrBlocksPerDay = 1440
+    /// Bookmarks reached in this run, saved when the sync ends.
+    private var rrPending: [String: Int] = [:]
+
+    private func rrKey(_ date: String) -> String { "\(tableId)|\(date)" }
+
     private func readRrInterval(_ done: @escaping (String?) -> Void) {
         guard let peripheral = peripheral else { return done("not ready") }
-        let total = readDays
+        let dates = queryDates
+        let saved = UserDefaults.standard.dictionary(forKey: HealthSync.rrBookmarkKey) as? [String: Int] ?? [:]
         func read(_ day: Int) {
-            guard day < total else { return done(nil) }
+            guard day < dates.count else { return done(nil) }
+            let key = rrKey(dates[day])
+            let last = saved[key] ?? 0
+            // A past day that was read to its end cannot get new blocks.
+            if last >= HealthSync.rrBlocksPerDay { return read(day + 1) }
+            var maxBlock = last
             var dayDone = false
-            peripheral.veepooSDK_readRRIntervalData(withDayNumber: day, blockNumber: 1) { [weak self] object, progress, error in
+            peripheral.veepooSDK_readRRIntervalData(withDayNumber: day, blockNumber: last + 1) { [weak self] object, progress, error in
                 DispatchQueue.main.async {
                     guard let self = self, !dayDone else { return }
                     if error != nil {
+                        // Also reported when there is no new block yet: keep the bookmark.
                         dayDone = true
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { read(day + 1) }
                         return
                     }
-                    if let rr = object as? VPRRIntervalDataModel { self.addRr(rr) }
+                    if let rr = object as? VPRRIntervalDataModel {
+                        self.addRr(rr)
+                        maxBlock = max(maxBlock, rr.blockNumber)
+                    }
                     let fraction = progress?.fractionCompleted ?? 0
-                    self.progress("rrinterval", (Double(day) + fraction) / Double(total))
+                    self.progress("rrinterval", (Double(day) + fraction) / Double(dates.count))
                     if fraction >= 1 {
                         dayDone = true
+                        self.rrPending[key] = day > 0 ? HealthSync.rrBlocksPerDay : maxBlock
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { read(day + 1) }
                     }
                 }
             }
         }
         read(0)
+    }
+
+    /// RR bookmarks of the last sync, saved by [confirmUpload].
+    private static var pendingRr: [String: Int] = [:]
+
+    /// The app uploaded the last sync's records: remember how far RR interval
+    /// was read so the next sync only reads new blocks; an unconfirmed run is
+    /// read again. Main thread.
+    static func confirmUpload() {
+        let confirmed = pendingRr
+        pendingRr = [:]
+        guard !confirmed.isEmpty else { return }
+        var saved = UserDefaults.standard.dictionary(forKey: rrBookmarkKey) as? [String: Int] ?? [:]
+        saved.merge(confirmed) { max($0, $1) }
+        let oldest = Calendar.current.date(byAdding: .day, value: -4, to: Date()) ?? Date()
+        saved = saved.filter { key, _ in
+            guard let date = key.split(separator: "|").last.flatMap({ HealthRecords.dateFormat.date(from: String($0)) }) else { return false }
+            return date >= oldest
+        }
+        UserDefaults.standard.set(saved, forKey: rrBookmarkKey)
     }
 
     private func addRr(_ rr: VPRRIntervalDataModel) {

@@ -284,6 +284,10 @@ class ReleepHbandSdkPlugin :
                 HBandManager.cancelSync()
                 result.success(null)
             }
+            "confirmHealthUpload" -> {
+                com.releep.releep_hband_sdk.health.HealthSync.confirmUpload(context)
+                result.success(null)
+            }
             "startMeasurement" -> {
                 val type = call.argument<String>("type") ?: ""
                 HBandManager.startMeasure(
