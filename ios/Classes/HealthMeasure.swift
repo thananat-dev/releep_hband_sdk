@@ -48,12 +48,13 @@ final class HealthMeasure {
     // Temperature watches can briefly report "busy" while an automatic health
     // reading is finishing. They can also report the raw/skin value in an
     // earlier callback and omit it from the final (100%) callback.
-    private static let temperatureMaxBusyRetries = 3
-    private static let temperatureBusyRetryDelay: TimeInterval = 1.5
+    private static let temperatureMaxBusyRetries = 5
+    private static let temperatureBusyRetryDelay: TimeInterval = 3
     private var temperatureBusyRetries = 0
     private var temperatureRetryItem: DispatchWorkItem?
     private var temperatureAttempt = 0
     private var lastTemperatureBase: Double?
+    private var lastTemperatureValue: Double?
 
     init(type: String, peripheral: VPPeripheralBaseManage,
          onUpdate: @escaping ([String: Any]) -> Void, onDone: @escaping ([String: Any]) -> Void) {
@@ -589,19 +590,33 @@ final class HealthMeasure {
             DispatchQueue.main.async {
                 // Ignore late callbacks from an attempt that was already retried.
                 guard let self = self, !self.finished, attempt == self.temperatureAttempt else { return }
+                NSLog("HBand temperature state=%d enable=%d progress=%d temp=%d original=%d",
+                      Int(state.rawValue), enable ? 1 : 0, progress, temp, original)
                 // Values are reported ×10 (°C).
                 if original > 0 { self.lastTemperatureBase = HealthRecords.round2(Double(original) / 10) }
+                let value = Double(temp) / 10
+                if value > 0 { self.lastTemperatureValue = value }
                 switch state.rawValue {
                 case 0: self.fail("Temperature measurement not supported")
                 case 9: self.fail("Watch is not worn correctly")
+                case 2: // Closed by the watch (e.g. measurement ended on the watch).
+                    if let last = self.lastTemperatureValue {
+                        var record: [String: Any] = ["value": HealthRecords.round2(last)]
+                        if let base = self.lastTemperatureBase { record["base_temp"] = base }
+                        self.succeed(record)
+                    } else {
+                        self.retryTemperatureAfterBusy()
+                    }
                 default:
-                    if !enable { return self.retryTemperatureAfterBusy() }
-                    let value = Double(temp) / 10
+                    // The header only says `enable` tells whether the watch is
+                    // busy — its polarity differs between firmwares. A watch
+                    // that reports progress or a value is measuring, not busy.
+                    if !enable && progress <= 0 && temp <= 0 { return self.retryTemperatureAfterBusy() }
                     var extra: [String: Any] = [:]
                     if let base = self.lastTemperatureBase { extra["base_temp"] = base }
                     self.update(progress, value > 0 ? value : nil, extra: extra)
-                    if progress >= 100 && value > 0 {
-                        var record: [String: Any] = ["value": HealthRecords.round2(value)]
+                    if progress >= 100, let last = self.lastTemperatureValue {
+                        var record: [String: Any] = ["value": HealthRecords.round2(last)]
                         if let base = self.lastTemperatureBase { record["base_temp"] = base }
                         self.succeed(record)
                     }
@@ -616,6 +631,9 @@ final class HealthMeasure {
             return fail("Watch is busy")
         }
         temperatureBusyRetries += 1
+        // Stop our own pending test first: a start sent while one is still
+        // open is answered "busy" again.
+        peripheral.veepooSDK_temperatureTestStart(false) { _, _, _, _, _ in }
         update(nil, nil)
         let item = DispatchWorkItem { [weak self] in self?.startTemperature() }
         temperatureRetryItem = item

@@ -1,3 +1,13 @@
+## 0.0.3
+
+* Body temperature measurement (Android + iOS): when the watch is busy, stops the pending test
+  before retrying, up to 5 times 3 s apart. iOS no longer treats `enable == false` as busy while
+  the watch reports progress or a value, and finishes with the last value when the watch closes
+  the test.
+* iOS connect: a connect to the watch already paired that stalls after JieLi auth is dropped and
+  retried automatically (15 s per attempt, 2 retries); a stalled silent auto-reconnect is retried
+  by the watchdog instead of blocking it until the app is relaunched.
+
 ## 0.0.2
 
 * Sleep: precise sleep segments linked by `lastType` / `nextType` (iOS) or `laster` / `next`

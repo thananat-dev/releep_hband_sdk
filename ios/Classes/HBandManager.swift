@@ -49,6 +49,13 @@ final class HBandManager {
     private static let emergencyDedupe: TimeInterval = 10
     private static let watchdogInterval: TimeInterval = 15
     private static let connectTimeout: TimeInterval = 45
+    /// A silent reconnect that has not reached "ready" by then is dropped and retried.
+    private static let restoreTimeout: TimeInterval = 25
+    /// A watch paired before connects in a few seconds; past this the attempt
+    /// has stalled (JieLi auth fails once, then the SDK never continues) →
+    /// drop the link and connect again, like tapping connect a second time.
+    private static let knownWatchAttemptTimeout: TimeInterval = 15
+    private static let knownWatchRetries = 2
     private static let maxEvents = 100
     private static let persistedEventsKey = "releep_hband_guard_events.emergencies"
 
@@ -73,6 +80,11 @@ final class HBandManager {
     private var customPasswordInFlight = false
     private var pendingConnect: (([String: Any?]) -> Void)?
     private var connectTimer: Timer?
+    private var restoreTimer: Timer?
+    private var connectRetriesLeft = 0
+    /// Set while a stalled attempt is dropped, so its failure callbacks do
+    /// not end the connect that is about to be retried.
+    private var retryingConnect = false
     private var restoreInProgress = false
 
     // guard
@@ -204,16 +216,59 @@ final class HBandManager {
             return
         }
         stopScan()
+        // A manual connect replaces a silent reconnect still in progress.
+        restoreTimer?.invalidate()
+        restoreTimer = nil
+        restoreInProgress = false
         pendingConnect = completion
-        connectTimer?.invalidate()
-        connectTimer = Timer.scheduledTimer(withTimeInterval: HBandManager.connectTimeout, repeats: false) { [weak self] _ in
-            guard let self = self, self.pendingConnect != nil else { return }
-            self.setState(HBandManager.stateFailed, "Connection timed out")
-            self.finishConnect(false, "Connection timed out")
-        }
+        let id = deviceId.uppercased()
+        let knownWatch = HBandSession.isConfigured && (id == HBandSession.scanId?.uppercased()
+            || id == HBandSession.deviceId?.uppercased()
+            || id == HBandSession.peripheralId?.uppercased()
+            || model.peripheral?.identifier.uuidString == HBandSession.peripheralId)
+        // A new watch may wait for the user to confirm on the watch: one long attempt.
+        connectRetriesLeft = knownWatch ? HBandManager.knownWatchRetries : 0
+        retryingConnect = false
         // Manual pairing → let the watch show its confirmation prompt.
         ble.deviceShowConfirm = true
-        startConnect(model: model, scanId: deviceId, name: name ?? model.deviceName, password: password, is24Hour: is24Hour)
+        let begin = { [weak self] in
+            guard let self = self else { return }
+            self.armConnectTimer(knownWatch ? HBandManager.knownWatchAttemptTimeout : HBandManager.connectTimeout) {
+                self.retryStalledConnect(model: model, scanId: deviceId, name: name, password: password, is24Hour: is24Hour)
+            }
+            self.startConnect(model: model, scanId: deviceId, name: name ?? model.deviceName, password: password, is24Hour: is24Hour)
+        }
+        begin()
+        retryConnect = begin
+    }
+
+    private var retryConnect: (() -> Void)?
+
+    private func armConnectTimer(_ seconds: TimeInterval, onStall: @escaping () -> Void) {
+        connectTimer?.invalidate()
+        connectTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
+            guard let self = self, self.pendingConnect != nil else { return }
+            onStall()
+        }
+    }
+
+    private func retryStalledConnect(model: VPPeripheralModel, scanId: String, name: String?, password: String, is24Hour: Bool) {
+        guard pendingConnect != nil else { return }
+        guard connectRetriesLeft > 0, let again = retryConnect else {
+            setState(HBandManager.stateFailed, "Connection timed out")
+            finishConnect(false, "Connection timed out")
+            return
+        }
+        connectRetriesLeft -= 1
+        NSLog("HBand connect stalled — dropping the link and retrying (%d left)", connectRetriesLeft)
+        recordStatus("Connect stalled — retrying")
+        retryingConnect = true
+        ble.veepooSDKDisconnectDevice()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self = self, self.pendingConnect != nil else { return }
+            self.retryingConnect = false
+            again()
+        }
     }
 
     private func startConnect(model: VPPeripheralModel, scanId: String, name: String?, password: String, is24Hour: Bool) {
@@ -233,6 +288,7 @@ final class HBandManager {
 
     /// DeviceConnectState of the connect call.
     private func onConnectBlock(_ raw: Int) {
+        if retryingConnect { return }
         switch raw {
         case 0: // BlePoweredOff
             fail("Bluetooth is turned off")
@@ -308,6 +364,8 @@ final class HBandManager {
     private func onSessionReady() {
         // Connect block + global state block can both report success.
         if state == HBandManager.stateReady && pendingConnect == nil { return }
+        restoreTimer?.invalidate()
+        restoreTimer = nil
         restoreInProgress = false
         let model = ble.peripheralModel
         // A watch connected through the link iOS holds was reported by its
@@ -344,6 +402,8 @@ final class HBandManager {
     private func finishConnect(_ success: Bool, _ message: String?) {
         connectTimer?.invalidate()
         connectTimer = nil
+        retryConnect = nil
+        retryingConnect = false
         guard let cb = pendingConnect else { return }
         pendingConnect = nil
         cb(result(success, message))
@@ -370,6 +430,8 @@ final class HBandManager {
         stopScan()
         ble.veepooSDKDisconnectDevice()
         pendingConnect = nil
+        restoreTimer?.invalidate()
+        restoreTimer = nil
         restoreInProgress = false
         currentScanId = nil
         currentName = nil
@@ -471,6 +533,18 @@ final class HBandManager {
         ble.deviceShowConfirm = false
         startConnect(model: model, scanId: id, name: HBandSession.name,
                      password: HBandSession.password, is24Hour: true)
+        // The first link after install can stall (JieLi pairing fails once and
+        // the SDK never reports success). Without this the restore stays "in
+        // progress" forever and the watchdog never retries.
+        restoreTimer?.invalidate()
+        restoreTimer = Timer.scheduledTimer(withTimeInterval: HBandManager.restoreTimeout, repeats: false) { [weak self] _ in
+            guard let self = self, self.restoreInProgress, self.pendingConnect == nil,
+                  self.state != HBandManager.stateReady else { return }
+            NSLog("HBand auto-restore stalled — dropping the link and retrying")
+            self.recordStatus("Reconnect stalled — retrying")
+            self.ble.veepooSDKDisconnectDevice()
+            self.restoreFailed()
+        }
     }
 
     /// Veepoo services, to find the watch among the peripherals iOS holds.
@@ -523,6 +597,8 @@ final class HBandManager {
     }
 
     private func restoreFailed() {
+        restoreTimer?.invalidate()
+        restoreTimer = nil
         restoreInProgress = false
         if state != HBandManager.statePasswordFailed {
             setState(HBandManager.stateDisconnected, "Watch not reachable — retrying")

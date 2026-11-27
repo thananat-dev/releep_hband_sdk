@@ -1,6 +1,6 @@
 name: releep_hband_sdk
 description: "Flutter plugin for Veepoo/HBand smartwatches: scan, connect, SOS & fall guard."
-version: 0.0.2
+version: 0.0.3
 homepage: https://github.com/thananat-dev/releep_hband_sdk
 repository: https://github.com/thananat-dev/releep_hband_sdk
 issue_tracker: https://github.com/thananat-dev/releep_hband_sdk/issues

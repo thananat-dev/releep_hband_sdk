@@ -122,8 +122,8 @@ class HealthMeasure(
         /** PTT has no final result event — capture this long, then build the record. */
         private const val PTT_CAPTURE_MS = 30_000L
 
-        private const val TEMPERATURE_MAX_BUSY_RETRIES = 3
-        private const val TEMPERATURE_BUSY_RETRY_MS = 1_500L
+        private const val TEMPERATURE_MAX_BUSY_RETRIES = 5
+        private const val TEMPERATURE_BUSY_RETRY_MS = 3_000L
     }
 
     private val timeout = Runnable { fail("Measurement timed out") }
@@ -248,6 +248,9 @@ class HealthMeasure(
         manager.startDetectTempture(write) { data ->
             main.post {
                 if (finished || attempt != temperatureAttempt) return@post
+                android.util.Log.d("HBandMeasure", "temperature attempt=$attempt oprate=${data.oprate} " +
+                    "deviceState=${data.deviceState} progress=${data.progress} " +
+                    "temp=${data.tempture} base=${data.temptureBase}")
                 if (data.temptureBase > 0) {
                     lastTemperatureBase = HealthSync.round2(data.temptureBase.toDouble())
                 }
@@ -285,6 +288,9 @@ class HealthMeasure(
         }
         temperatureBusyRetries++
         temperatureRetryScheduled = true
+        // Stop our own pending test first: a start sent while one is still
+        // open is answered "busy" again.
+        try { manager.stopDetectTempture(write, null) } catch (_: Exception) {}
         update(null, null)
         main.postDelayed(temperatureRetry, TEMPERATURE_BUSY_RETRY_MS)
     }

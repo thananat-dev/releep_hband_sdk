@@ -6,7 +6,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'releep_hband_sdk'
-  s.version          = '0.0.2'
+  s.version          = '0.0.3'
   s.summary          = 'Flutter plugin for Veepoo/HBand smartwatches: scan, connect, SOS & fall guard.'
   s.description      = <<-DESC
 Flutter plugin for Veepoo/HBand smartwatches: scan, connect, SOS & fall guard.
